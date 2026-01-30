@@ -526,6 +526,7 @@ def ensure_domain_monitors(
     *,
     domain: str,
     site_path: str,
+    cached_push_token: Optional[str] = None,
 ) -> Tuple[int, int, str]:
     try:
         kuma.refresh_monitor_list()
@@ -635,10 +636,21 @@ def ensure_domain_monitors(
         if cfg.dry_run:
             push_token = ""
         else:
-            full = kuma.get_monitor(checksum_id)
-            push_token = str(full.get("pushToken") or "")
+            if cached_push_token:
+                push_token = cached_push_token
+            else:
+                full = kuma.get_monitor(checksum_id)
+                push_token = str(full.get("pushToken") or full.get("push_token") or "")
+
             if not push_token:
-                raise RuntimeError("kuma_push_token_missing")
+                new_token = secrets.token_hex(16)
+                full = kuma.get_monitor(checksum_id)
+                full["pushToken"] = new_token
+                if checksum_parent is not None:
+                    full["parent"] = checksum_parent
+                kuma.edit_monitor(full)
+                push_token = new_token
+                log_event("kuma_push_token_set", domain=domain, monitor_id=checksum_id)
 
         if cfg.allow_take_ownership and not monitor_managed_by_wpcheck(checksum_mon):
             full = kuma.get_monitor(checksum_id)
@@ -866,7 +878,14 @@ def main() -> int:
 
                 domain = res.domain
                 def _ensure():
-                    return ensure_domain_monitors(kuma, cfg, domain=domain, site_path=res.site_path)
+                    cached_token = str(cache.get(domain, {}).get("checksum_token") or "")
+                    return ensure_domain_monitors(
+                        kuma,
+                        cfg,
+                        domain=domain,
+                        site_path=res.site_path,
+                        cached_push_token=cached_token or None,
+                    )
 
                 http_id, checksum_id, push_token = retry(
                     _ensure,
