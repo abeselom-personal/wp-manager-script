@@ -421,7 +421,7 @@ class KumaClient:
         return monitors
 
     def get_monitor(self, monitor_id: int) -> Dict[str, Any]:
-        res = self._sio.call("getMonitor", {"monitorID": monitor_id}, timeout=self._cfg.request_timeout)
+        res = self._sio.call("getMonitor", monitor_id, timeout=self._cfg.request_timeout)
         if not isinstance(res, dict) or not res.get("ok"):
             raise RuntimeError(f"kuma_get_monitor_failed:{res}")
         monitor = res.get("monitor")
@@ -430,7 +430,9 @@ class KumaClient:
         return monitor
 
     def add_monitor(self, monitor: Dict[str, Any]) -> int:
-        res = self._sio.call("add", {"monitor": monitor}, timeout=self._cfg.request_timeout)
+        monitor.setdefault("notificationIDList", [])
+        monitor.setdefault("accepted_statuscodes", ["200-299"])
+        res = self._sio.call("add", monitor, timeout=self._cfg.request_timeout)
         if not isinstance(res, dict) or not res.get("ok"):
             raise RuntimeError(f"kuma_add_monitor_failed:{res}")
         mid = res.get("monitorID")
@@ -441,7 +443,9 @@ class KumaClient:
         return int(mid)
 
     def edit_monitor(self, monitor: Dict[str, Any]) -> int:
-        res = self._sio.call("editMonitor", {"monitor": monitor}, timeout=self._cfg.request_timeout)
+        monitor.setdefault("notificationIDList", [])
+        monitor.setdefault("accepted_statuscodes", ["200-299"])
+        res = self._sio.call("editMonitor", monitor, timeout=self._cfg.request_timeout)
         if not isinstance(res, dict) or not res.get("ok"):
             raise RuntimeError(f"kuma_edit_monitor_failed:{res}")
         mid = res.get("monitorID")
@@ -452,7 +456,7 @@ class KumaClient:
         return int(mid)
 
     def delete_monitor(self, monitor_id: int) -> None:
-        res = self._sio.call("deleteMonitor", {"monitorID": monitor_id}, timeout=self._cfg.request_timeout)
+        res = self._sio.call("deleteMonitor", monitor_id, timeout=self._cfg.request_timeout)
         if not isinstance(res, dict) or not res.get("ok"):
             raise RuntimeError(f"kuma_delete_monitor_failed:{res}")
 
