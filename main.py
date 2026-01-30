@@ -79,6 +79,7 @@ class Config:
     http_interval: int
     http_retries: int
     request_timeout: int
+    monitor_list_timeout: int
     wp_timeout: int
     workers: int
     enable_core_redownload: bool
@@ -128,6 +129,7 @@ def load_config(args: argparse.Namespace) -> Config:
     http_interval = _env_int("WPCHECK_HTTP_INTERVAL", 60)
     http_retries = _env_int("WPCHECK_HTTP_RETRIES", 5)
     request_timeout = _env_int("WPCHECK_REQUEST_TIMEOUT", 15)
+    monitor_list_timeout = _env_int("WPCHECK_MONITOR_LIST_TIMEOUT", 60)
     wp_timeout = _env_int("WPCHECK_WP_TIMEOUT", 120)
 
     workers = args.workers if args.workers is not None else _env_int("WPCHECK_WORKERS", 8)
@@ -157,6 +159,7 @@ def load_config(args: argparse.Namespace) -> Config:
         http_interval=http_interval,
         http_retries=http_retries,
         request_timeout=request_timeout,
+        monitor_list_timeout=monitor_list_timeout,
         wp_timeout=wp_timeout,
         workers=workers,
         enable_core_redownload=enable_core_redownload,
@@ -335,14 +338,29 @@ class KumaClient:
             http_session=self._session,
         )
         self._monitor_list: Dict[str, Any] = {}
+        self._monitor_list_received = False
         self._info: Dict[str, Any] = {}
         self._connected = False
         self._sio.on("monitorList", self._on_monitor_list)
         self._sio.on("info", self._on_info)
 
     def _on_monitor_list(self, data: Any) -> None:
+        self._monitor_list_received = True
         if isinstance(data, dict):
-            self._monitor_list = data
+            if "monitorList" in data and isinstance(data.get("monitorList"), dict):
+                self._monitor_list = data["monitorList"]
+            else:
+                self._monitor_list = data
+        elif isinstance(data, list):
+            rebuilt: Dict[str, Any] = {}
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                mid = item.get("id")
+                if mid is None:
+                    continue
+                rebuilt[str(mid)] = item
+            self._monitor_list = rebuilt
 
     def _on_info(self, data: Any) -> None:
         if isinstance(data, dict):
@@ -351,28 +369,40 @@ class KumaClient:
     def connect_and_login(self) -> None:
         if not self._cfg.kuma_url:
             raise ValueError("missing_kuma_url")
+        if self._connected:
+            self.disconnect()
+        self._monitor_list = {}
+        self._monitor_list_received = False
+
         transports = ["websocket", "polling"] if websocket_client_available() else ["polling"]
-        self._sio.connect(self._cfg.kuma_url, transports=transports, wait_timeout=self._cfg.request_timeout)
-        self._connected = True
+        try:
+            log_event("kuma_socket_connect", url=self._cfg.kuma_url, transports=transports)
+            self._sio.connect(self._cfg.kuma_url, transports=transports, wait_timeout=self._cfg.request_timeout)
+            self._connected = True
 
-        login_data: Dict[str, Any] = {
-            "username": self._cfg.kuma_user,
-            "password": self._cfg.kuma_pass,
-        }
-        if self._cfg.kuma_2fa_token:
-            login_data["token"] = self._cfg.kuma_2fa_token
+            login_data: Dict[str, Any] = {
+                "username": self._cfg.kuma_user,
+                "password": self._cfg.kuma_pass,
+            }
+            if self._cfg.kuma_2fa_token:
+                login_data["token"] = self._cfg.kuma_2fa_token
 
-        res = self._sio.call("login", login_data, timeout=self._cfg.request_timeout)
-        if not isinstance(res, dict) or not res.get("ok"):
-            raise RuntimeError(f"kuma_login_failed:{res}")
+            res = self._sio.call("login", login_data, timeout=self._cfg.request_timeout)
+            if not isinstance(res, dict) or not res.get("ok"):
+                raise RuntimeError(f"kuma_login_failed:{res}")
+            log_event("kuma_socket_login_ok", url=self._cfg.kuma_url)
 
-        end = time.time() + float(self._cfg.request_timeout)
-        while time.time() < end:
-            if self._monitor_list:
-                break
-            time.sleep(0.25)
-        if not self._monitor_list:
-            raise RuntimeError("kuma_monitor_list_not_received")
+            end = time.time() + float(self._cfg.monitor_list_timeout)
+            while time.time() < end:
+                if self._monitor_list_received:
+                    break
+                time.sleep(0.25)
+            if not self._monitor_list_received:
+                raise RuntimeError("kuma_monitor_list_not_received")
+            log_event("kuma_monitor_list_received", count=len(self._monitor_list))
+        except Exception:
+            self.disconnect()
+            raise
 
     def disconnect(self) -> None:
         try:

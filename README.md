@@ -134,6 +134,8 @@ If group IDs are invalid or unset, monitors will be created without a parent.
 - `WPCHECK_HTTP_INTERVAL` (default: `60`)
 - `WPCHECK_HTTP_RETRIES` (default: `5`)
 - `WPCHECK_REQUEST_TIMEOUT` (default: `15`)
+- `WPCHECK_MONITOR_LIST_TIMEOUT` (default: `60`)
+  - How long to wait after successful Socket.IO login for the initial `monitorList` event.
 - `WPCHECK_WP_TIMEOUT` (default: `120`)
 
 ### Concurrency
@@ -328,6 +330,11 @@ This usually means **Socket.IO/WebSocket** is blocked.
 - If behind Nginx/Traefik, ensure WebSocket upgrade headers are configured.
 - Ensure Kuma is reachable via WebSocket:
   - Proxy must allow `Upgrade: websocket`.
+
+If login succeeds but you see `kuma_monitor_list_not_received`:
+
+- Increase `WPCHECK_MONITOR_LIST_TIMEOUT` (e.g. `120` or `180`).
+- If Kuma is behind Traefik/Nginx, confirm Socket.IO long-polling endpoints are not being cached or buffered.
 
 ### 4) WP-CLI timeouts (`wp_timeout`)
 
