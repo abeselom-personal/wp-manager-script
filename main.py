@@ -540,9 +540,12 @@ def ensure_domain_monitors(
             "type": "http",
             "name": http_name,
             "url": f"https://{domain}",
+            "method": "GET",
             "interval": cfg.http_interval,
             "retryInterval": cfg.http_interval,
             "maxretries": cfg.http_retries,
+            "acceptedStatusCodes": ["200-299"],
+            "notificationIDList": [],
             "description": build_description(site_path, domain, "http"),
         }
         if http_parent is not None:
@@ -572,6 +575,7 @@ def ensure_domain_monitors(
             "type": "push",
             "name": checksum_name,
             "interval": cfg.push_interval,
+            "notificationIDList": [],
             "description": build_description(site_path, domain, "checksum"),
         }
         if checksum_parent is not None:
@@ -708,9 +712,16 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
                 try:
                     dst = quarantine_file(site_path, cfg.quarantine_dir, domain, rel_path, cfg.dry_run)
                     quarantined.append((rel_path, dst))
+                    if dst is None:
+                        log_event("quarantine_missing_source", result="error", domain=domain, site_path=site_path, rel_path=rel_path)
+                    else:
+                        log_event("quarantine_moved", domain=domain, site_path=site_path, rel_path=rel_path, dst=dst, dry_run=cfg.dry_run)
                 except Exception as e:
                     quarantined.append((rel_path, None))
                     log_event("quarantine_failed", result="error", domain=domain, site_path=site_path, rel_path=rel_path, error=str(e))
+
+            if not suspicious:
+                log_event("quarantine_no_matches", domain=domain, site_path=site_path)
 
             if suspicious and not cfg.dry_run:
                 out, err, rc = run_wp(
