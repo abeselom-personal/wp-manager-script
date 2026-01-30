@@ -544,7 +544,7 @@ def ensure_domain_monitors(
             "interval": cfg.http_interval,
             "retryInterval": cfg.http_interval,
             "maxretries": cfg.http_retries,
-            "acceptedStatusCodes": ["200-299"],
+            "accepted_statuscodes": ["200-299"],
             "notificationIDList": [],
             "description": build_description(site_path, domain, "http"),
         }
@@ -575,6 +575,7 @@ def ensure_domain_monitors(
             "type": "push",
             "name": checksum_name,
             "interval": cfg.push_interval,
+            "accepted_statuscodes": ["200-299"],
             "notificationIDList": [],
             "description": build_description(site_path, domain, "checksum"),
         }
