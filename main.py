@@ -31,6 +31,27 @@ def _env_int(name: str, default: int) -> int:
     return int(v)
 
 
+def normalize_base_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "http://" + raw
+    p = urlparse(raw)
+    if not p.scheme or not p.netloc:
+        return (raw or "").rstrip("/")
+    return f"{p.scheme}://{p.netloc}".rstrip("/")
+
+
+def websocket_client_available() -> bool:
+    try:
+        import websocket  # type: ignore
+
+        return True
+    except Exception:
+        return False
+
+
 def _env_optional_int(name: str) -> Optional[int]:
     v = os.environ.get(name)
     if v is None:
@@ -93,7 +114,7 @@ def load_config(args: argparse.Namespace) -> Config:
     ignore_file = os.environ.get("WPCHECK_IGNORE_FILE", "/wpcheck/wp_checksum_ignore.txt")
     quarantine_dir = os.environ.get("WPCHECK_QUARANTINE_DIR", "/wpcheck/quarantine")
 
-    kuma_url = os.environ.get("WPCHECK_KUMA_URL", "").strip().rstrip("/")
+    kuma_url = normalize_base_url(os.environ.get("WPCHECK_KUMA_URL", ""))
     kuma_user = os.environ.get("WPCHECK_KUMA_USER", "").strip()
     kuma_pass = os.environ.get("WPCHECK_KUMA_PASS", "")
     kuma_2fa_token = os.environ.get("WPCHECK_KUMA_2FA_TOKEN")
@@ -330,7 +351,8 @@ class KumaClient:
     def connect_and_login(self) -> None:
         if not self._cfg.kuma_url:
             raise ValueError("missing_kuma_url")
-        self._sio.connect(self._cfg.kuma_url, transports=["websocket", "polling"], wait_timeout=self._cfg.request_timeout)
+        transports = ["websocket", "polling"] if websocket_client_available() else ["polling"]
+        self._sio.connect(self._cfg.kuma_url, transports=transports, wait_timeout=self._cfg.request_timeout)
         self._connected = True
 
         login_data: Dict[str, Any] = {

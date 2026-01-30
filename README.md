@@ -58,7 +58,11 @@ Verify:
 ### Network / Uptime Kuma
 
 - Your host must be able to reach the Kuma instance at `WPCHECK_KUMA_URL`.
+- `WPCHECK_KUMA_URL` must be the **base URL** (no UI paths like `/dashboard`).
+  - Good: `http://kuma.example.com:3001`
+  - Bad: `http://kuma.example.com:3001/dashboard`
 - If Kuma is behind a reverse proxy, ensure **WebSocket upgrade is supported**, otherwise monitor CRUD (Socket.IO) may fail.
+  - If `websocket-client` is not installed, the script will fall back to **polling-only** Socket.IO transport.
 
 ---
 
