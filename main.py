@@ -432,6 +432,10 @@ class KumaClient:
     def add_monitor(self, monitor: Dict[str, Any]) -> int:
         monitor.setdefault("notificationIDList", [])
         monitor.setdefault("accepted_statuscodes", ["200-299"])
+        monitor.setdefault("conditions", [])
+        monitor.setdefault("kafkaProducerBrokers", [])
+        monitor.setdefault("kafkaProducerSaslOptions", {})
+        monitor.setdefault("rabbitmqNodes", [])
         res = self._sio.call("add", monitor, timeout=self._cfg.request_timeout)
         if not isinstance(res, dict) or not res.get("ok"):
             raise RuntimeError(f"kuma_add_monitor_failed:{res}")
@@ -445,6 +449,10 @@ class KumaClient:
     def edit_monitor(self, monitor: Dict[str, Any]) -> int:
         monitor.setdefault("notificationIDList", [])
         monitor.setdefault("accepted_statuscodes", ["200-299"])
+        monitor.setdefault("conditions", [])
+        monitor.setdefault("kafkaProducerBrokers", [])
+        monitor.setdefault("kafkaProducerSaslOptions", {})
+        monitor.setdefault("rabbitmqNodes", [])
         res = self._sio.call("editMonitor", monitor, timeout=self._cfg.request_timeout)
         if not isinstance(res, dict) or not res.get("ok"):
             raise RuntimeError(f"kuma_edit_monitor_failed:{res}")
