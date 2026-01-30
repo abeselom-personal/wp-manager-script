@@ -8,6 +8,7 @@ import time
 import sys
 import shutil
 import socket
+import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -411,6 +412,20 @@ class KumaClient:
         finally:
             self._connected = False
 
+    def refresh_monitor_list(self) -> None:
+        self._monitor_list_received = False
+        res = self._sio.call("getMonitorList", timeout=self._cfg.request_timeout)
+        if not isinstance(res, dict) or not res.get("ok"):
+            raise RuntimeError(f"kuma_get_monitor_list_failed:{res}")
+
+        end = time.time() + float(self._cfg.monitor_list_timeout)
+        while time.time() < end:
+            if self._monitor_list_received:
+                break
+            time.sleep(0.25)
+        if not self._monitor_list_received:
+            raise RuntimeError("kuma_monitor_list_not_received")
+
     def list_monitors(self) -> List[Dict[str, Any]]:
         monitors: List[Dict[str, Any]] = []
         for mid, mon in self._monitor_list.items():
@@ -512,6 +527,11 @@ def ensure_domain_monitors(
     domain: str,
     site_path: str,
 ) -> Tuple[int, int, str]:
+    try:
+        kuma.refresh_monitor_list()
+    except Exception:
+        pass
+
     monitors = kuma.list_monitors()
 
     http_name = f"WP | {domain} | HTTP"
@@ -566,6 +586,10 @@ def ensure_domain_monitors(
             http_id = -1
         else:
             http_id = kuma.add_monitor(monitor_obj)
+            try:
+                kuma.refresh_monitor_list()
+            except Exception:
+                pass
         log_event("kuma_http_monitor_create", domain=domain, monitor_id=http_id, name=http_name, dry_run=cfg.dry_run)
     else:
         http_id = int(http_mon["id"])
@@ -583,12 +607,14 @@ def ensure_domain_monitors(
                 log_event("kuma_http_monitor_take_ownership", domain=domain, monitor_id=http_id)
 
     if checksum_mon is None:
+        generated_push_token = secrets.token_hex(16)
         monitor_obj = {
             "type": "push",
             "name": checksum_name,
             "interval": cfg.push_interval,
             "accepted_statuscodes": ["200-299"],
             "notificationIDList": [],
+            "pushToken": generated_push_token,
             "description": build_description(site_path, domain, "checksum"),
         }
         if checksum_parent is not None:
@@ -598,17 +624,11 @@ def ensure_domain_monitors(
             push_token = ""
         else:
             checksum_id = kuma.add_monitor(monitor_obj)
-            full = retry(
-                lambda: kuma.get_monitor(checksum_id),
-                retries=5,
-                base_delay=0.5,
-                max_delay=5,
-                action="kuma_get_push_token",
-                domain=domain,
-            )
-            push_token = str(full.get("pushToken") or "")
-            if not push_token:
-                raise RuntimeError("kuma_push_token_missing")
+            push_token = generated_push_token
+            try:
+                kuma.refresh_monitor_list()
+            except Exception:
+                pass
         log_event("kuma_checksum_monitor_create", domain=domain, monitor_id=checksum_id, name=checksum_name, dry_run=cfg.dry_run)
     else:
         checksum_id = int(checksum_mon["id"])
