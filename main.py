@@ -312,9 +312,15 @@ def quarantine_file(site_root: str, quarantine_root: str, domain: str, rel_path:
         return None
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     dst = os.path.join(quarantine_root, domain, ts, rel_path)
-    safe_mkdir(os.path.dirname(dst))
     if dry_run:
         return dst
+    safe_mkdir(os.path.dirname(dst))
+    if os.path.exists(dst):
+        base = dst
+        i = 1
+        while os.path.exists(dst):
+            dst = f"{base}.{i}"
+            i += 1
     shutil.move(src, dst)
     return dst
 
