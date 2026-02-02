@@ -9,6 +9,7 @@ import sys
 import shutil
 import socket
 import secrets
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -745,8 +746,14 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
             cfg.wp_timeout,
         )
         domain = parse_site_domain(out)
+        missing_domain = False
+        quarantine_domain = domain
         if not domain:
-            return SiteResult(site_path=site_path, domain=None, ignored=False, checksum_failed=True, quarantined=[], error="missing_domain")
+            missing_domain = True
+            base = (os.path.basename(os.path.normpath(site_path)) or "site").strip().lower()
+            base = "".join(c if (c.isalnum() or c in {"-", "_", "."}) else "_" for c in base)[:60] or "site"
+            digest = hashlib.sha1(site_path.encode("utf-8")).hexdigest()[:10]
+            quarantine_domain = f"missing-domain-{base}-{digest}"
         if domain in ignored_set:
             return SiteResult(site_path=site_path, domain=domain, ignored=True, checksum_failed=False, quarantined=[], error=None)
 
@@ -779,13 +786,13 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
                 rel_path_clean = rel_path.lstrip("/\\")
                 src = os.path.normpath(os.path.join(site_path, rel_path_clean))
                 try:
-                    dst = quarantine_file(site_path, cfg.quarantine_dir, domain, rel_path, cfg.dry_run)
+                    dst = quarantine_file(site_path, cfg.quarantine_dir, str(quarantine_domain), rel_path, cfg.dry_run)
                     quarantined.append((rel_path, dst))
                     if dst is None:
                         log_event(
                             "quarantine_missing_source",
                             result="error",
-                            domain=domain,
+                            domain=str(quarantine_domain),
                             site_path=site_path,
                             rel_path=rel_path,
                             src=src,
@@ -799,7 +806,7 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
                         log_event(
                             "quarantine_moved",
                             result="ok" if moved_ok else "error",
-                            domain=domain,
+                            domain=str(quarantine_domain),
                             site_path=site_path,
                             rel_path=rel_path,
                             src=src,
@@ -812,7 +819,7 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
                     log_event(
                         "quarantine_failed",
                         result="error",
-                        domain=domain,
+                        domain=str(quarantine_domain),
                         site_path=site_path,
                         rel_path=rel_path,
                         src=src,
@@ -831,7 +838,14 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
                 )
                 failed = checksum_failed(out, err, rc)
 
-        return SiteResult(site_path=site_path, domain=domain, ignored=False, checksum_failed=failed, quarantined=quarantined, error=None)
+        return SiteResult(
+            site_path=site_path,
+            domain=domain,
+            ignored=False,
+            checksum_failed=failed,
+            quarantined=quarantined,
+            error="missing_domain" if missing_domain else None,
+        )
     except subprocess.TimeoutExpired:
         return SiteResult(site_path=site_path, domain=None, ignored=False, checksum_failed=True, quarantined=quarantined, error="wp_timeout")
     except Exception as e:
@@ -926,6 +940,7 @@ def main() -> int:
                         "site_processed",
                         result="error",
                         site_path=res.site_path,
+                        quarantined=len(res.quarantined),
                         error=res.error or "unknown",
                     )
                     if res.error == "missing_domain":
