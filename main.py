@@ -89,6 +89,8 @@ class Config:
     allow_delete_managed_duplicates: bool
     allow_delete_ignored_managed: bool
     dry_run: bool
+    missing_domain_push_token: str
+    missing_domain_alert_threshold: int
 
 
 def load_config(args: argparse.Namespace) -> Config:
@@ -144,6 +146,9 @@ def load_config(args: argparse.Namespace) -> Config:
     allow_delete_managed_duplicates = _env_bool("WPCHECK_DELETE_MANAGED_DUPLICATES", True)
     allow_delete_ignored_managed = bool(args.cleanup_ignored) or _env_bool("WPCHECK_CLEANUP_IGNORED", False)
 
+    missing_domain_push_token = str(os.environ.get("WPCHECK_MISSING_DOMAIN_PUSH_TOKEN", "") or "").strip()
+    missing_domain_alert_threshold = _env_int("WPCHECK_MISSING_DOMAIN_ALERT_THRESHOLD", 0)
+
     return Config(
         wpcli=wpcli,
         home_dir=home_dir,
@@ -169,6 +174,8 @@ def load_config(args: argparse.Namespace) -> Config:
         allow_delete_managed_duplicates=allow_delete_managed_duplicates,
         allow_delete_ignored_managed=allow_delete_ignored_managed,
         dry_run=dry_run,
+        missing_domain_push_token=missing_domain_push_token,
+        missing_domain_alert_threshold=missing_domain_alert_threshold,
     )
 
 
@@ -322,6 +329,8 @@ def quarantine_file(site_root: str, quarantine_root: str, domain: str, rel_path:
             dst = f"{base}.{i}"
             i += 1
     shutil.move(src, dst)
+    if os.path.exists(src):
+        raise RuntimeError("quarantine_source_still_exists")
     return dst
 
 
@@ -329,6 +338,13 @@ def find_wp_sites(base: str) -> List[str]:
     hits: List[str] = []
     for root, _, files in os.walk(base):
         if "wp-config.php" in files:
+            if f"{os.sep}wp-content{os.sep}" in root:
+                continue
+            if not (
+                os.path.isdir(os.path.join(root, "wp-includes"))
+                or os.path.isdir(os.path.join(root, "wp-admin"))
+            ):
+                continue
             hits.append(root)
     return hits
 
@@ -760,16 +776,48 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
         if failed and cfg.quarantine_should_not_exist:
             suspicious = extract_should_not_exist_files(out, err)
             for rel_path in suspicious:
+                rel_path_clean = rel_path.lstrip("/\\")
+                src = os.path.normpath(os.path.join(site_path, rel_path_clean))
                 try:
                     dst = quarantine_file(site_path, cfg.quarantine_dir, domain, rel_path, cfg.dry_run)
                     quarantined.append((rel_path, dst))
                     if dst is None:
-                        log_event("quarantine_missing_source", result="error", domain=domain, site_path=site_path, rel_path=rel_path)
+                        log_event(
+                            "quarantine_missing_source",
+                            result="error",
+                            domain=domain,
+                            site_path=site_path,
+                            rel_path=rel_path,
+                            src=src,
+                            src_exists=os.path.exists(src),
+                            dry_run=cfg.dry_run,
+                        )
                     else:
-                        log_event("quarantine_moved", domain=domain, site_path=site_path, rel_path=rel_path, dst=dst, dry_run=cfg.dry_run)
+                        moved_ok = True
+                        if not cfg.dry_run:
+                            moved_ok = os.path.exists(dst) and not os.path.exists(src)
+                        log_event(
+                            "quarantine_moved",
+                            result="ok" if moved_ok else "error",
+                            domain=domain,
+                            site_path=site_path,
+                            rel_path=rel_path,
+                            src=src,
+                            dst=dst,
+                            moved_ok=moved_ok,
+                            dry_run=cfg.dry_run,
+                        )
                 except Exception as e:
                     quarantined.append((rel_path, None))
-                    log_event("quarantine_failed", result="error", domain=domain, site_path=site_path, rel_path=rel_path, error=str(e))
+                    log_event(
+                        "quarantine_failed",
+                        result="error",
+                        domain=domain,
+                        site_path=site_path,
+                        rel_path=rel_path,
+                        src=src,
+                        error=str(e),
+                    )
 
             if not suspicious:
                 log_event("quarantine_no_matches", domain=domain, site_path=site_path)
@@ -857,6 +905,7 @@ def main() -> int:
 
         log_event("scan_start", sites=len(sites), workers=cfg.workers)
         failed_sites: Dict[str, str] = {}
+        missing_domain_count = 0
 
         with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
             futures = {ex.submit(process_site, cfg, site, ignored_set): site for site in sites}
@@ -879,6 +928,8 @@ def main() -> int:
                         site_path=res.site_path,
                         error=res.error or "unknown",
                     )
+                    if res.error == "missing_domain":
+                        missing_domain_count += 1
                 if res.ignored or not res.domain:
                     continue
 
@@ -932,7 +983,32 @@ def main() -> int:
                 if res.checksum_failed:
                     failed_sites[domain] = res.site_path
 
-        log_event("scan_complete", failed=len(failed_sites))
+        if cfg.missing_domain_push_token and not cfg.dry_run:
+            status = "up"
+            if cfg.missing_domain_alert_threshold > 0 and missing_domain_count > cfg.missing_domain_alert_threshold:
+                status = "down"
+            retry(
+                lambda: send_push(
+                    cfg.kuma_url,
+                    cfg.missing_domain_push_token,
+                    status=status,
+                    msg=f"missing_domain={missing_domain_count};sites={len(sites)}",
+                    timeout_s=cfg.request_timeout,
+                ),
+                retries=3,
+                base_delay=1,
+                max_delay=10,
+                action="kuma_missing_domain_metric",
+                missing_domain_count=missing_domain_count,
+            )
+            log_event(
+                "missing_domain_metric",
+                missing_domain_count=missing_domain_count,
+                sites=len(sites),
+                threshold=cfg.missing_domain_alert_threshold,
+            )
+
+        log_event("scan_complete", failed=len(failed_sites), missing_domain_count=missing_domain_count)
         for d, p in sorted(failed_sites.items()):
             log_event("checksum_failure", result="error", domain=d, site_path=p)
         return 1 if failed_sites else 0
