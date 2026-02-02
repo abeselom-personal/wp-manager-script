@@ -527,6 +527,48 @@ def build_description(site_path: str, domain: str, kind: str) -> str:
     return f"managed_by=wpcheck;domain={domain};kind={kind};wp_path={site_path}"
 
 
+def cleanup_ignored_domain(kuma: "KumaClient", cfg: Config, cache: Dict[str, Any], domain: str) -> None:
+    domain_l = (domain or "").strip().lower()
+    if not domain_l:
+        return
+
+    monitors = kuma.list_monitors()
+    deleted_any = False
+    for mon in monitors:
+        if not isinstance(mon, dict):
+            continue
+        if not monitor_managed_by_wpcheck(mon):
+            continue
+        desc_l = str(mon.get("description") or "").lower()
+        if f"domain={domain_l};" not in desc_l:
+            continue
+        mid = mon.get("id")
+        name = str(mon.get("name") or "")
+        if cfg.dry_run:
+            log_event("cleanup_delete", domain=domain_l, monitor_id=mid, name=name, dry_run=True)
+            deleted_any = True
+            continue
+        try:
+            kuma.delete_monitor(int(mid))
+            log_event("cleanup_delete", domain=domain_l, monitor_id=int(mid), name=name)
+            deleted_any = True
+        except Exception as e:
+            log_event("cleanup_delete", result="error", domain=domain_l, monitor_id=mid, name=name, error=str(e))
+
+    if domain_l in cache:
+        if cfg.dry_run:
+            log_event("cleanup_cache_purge", domain=domain_l, dry_run=True)
+        else:
+            del cache[domain_l]
+            log_event("cleanup_cache_purge", domain=domain_l)
+            try:
+                write_cache_atomic(cfg.cache_file, cache)
+            except Exception as e:
+                log_event("cache_write", result="error", domain=domain_l, error=str(e), path=cfg.cache_file)
+    elif deleted_any:
+        log_event("cleanup_cache_missing", domain=domain_l)
+
+
 def ensure_group_exists(kuma: KumaClient, group_id: Optional[int]) -> Optional[int]:
     if group_id is None:
         return None
@@ -827,7 +869,7 @@ def process_site(cfg: Config, site_path: str, ignored_set: set) -> SiteResult:
                     )
 
             if not suspicious:
-                log_event("quarantine_no_matches", domain=domain, site_path=site_path)
+                log_event("quarantine_no_matches", domain=str(quarantine_domain), site_path=site_path)
 
             if suspicious and not cfg.dry_run:
                 out, err, rc = run_wp(
@@ -886,26 +928,8 @@ def main() -> int:
                 log_event("cleanup_skipped", result="error", error="cleanup_requires_flag", hint="use --cleanup-ignored")
                 return 2
 
-            monitors = kuma.list_monitors()
-            for mon in monitors:
-                name = str(mon.get("name") or "")
-                if not name.startswith("WP | "):
-                    continue
-                desc = str(mon.get("description") or "")
-                domain = None
-                if "domain=" in desc:
-                    _, _, tail = desc.partition("domain=")
-                    domain = tail.split(";", 1)[0].strip().lower() or None
-                if not domain or domain not in ignored_set:
-                    continue
-                if not monitor_managed_by_wpcheck(mon):
-                    log_event("cleanup_skip_unmanaged", domain=domain, monitor_id=mon.get("id"), name=name)
-                    continue
-                if cfg.dry_run:
-                    log_event("cleanup_delete", domain=domain, monitor_id=mon.get("id"), name=name, dry_run=True)
-                    continue
-                kuma.delete_monitor(int(mon["id"]))
-                log_event("cleanup_delete", domain=domain, monitor_id=int(mon["id"]), name=name)
+            for domain in sorted(ignored_set):
+                cleanup_ignored_domain(kuma, cfg, cache, domain)
             return 0
 
         sites: List[str] = []
@@ -940,11 +964,16 @@ def main() -> int:
                         "site_processed",
                         result="error",
                         site_path=res.site_path,
+                        checksum_failed=res.checksum_failed,
                         quarantined=len(res.quarantined),
                         error=res.error or "unknown",
                     )
                     if res.error == "missing_domain":
                         missing_domain_count += 1
+
+                if res.ignored and res.domain and cfg.allow_delete_ignored_managed:
+                    cleanup_ignored_domain(kuma, cfg, cache, res.domain)
+
                 if res.ignored or not res.domain:
                     continue
 
