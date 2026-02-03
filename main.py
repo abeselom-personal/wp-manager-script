@@ -1191,9 +1191,25 @@ def preflight(cfg: Config) -> None:
             f"{cfg.kuma_url}/api/entry-page",
             timeout=cfg.request_timeout,
             verify=bool(cfg.kuma_verify_ssl),
+            allow_redirects=False,
         )
+        if 300 <= int(r.status_code) < 400:
+            loc = str(r.headers.get("Location") or "")
+            if loc:
+                raise RuntimeError(
+                    f"kuma_url_redirect:{r.status_code};location={loc};hint=Set WPCHECK_KUMA_URL to the final scheme/host (e.g. https://...) to avoid redirects"
+                )
+            raise RuntimeError(
+                f"kuma_url_redirect:{r.status_code};hint=Set WPCHECK_KUMA_URL to the final scheme/host (e.g. https://...) to avoid redirects"
+            )
         if r.status_code >= 400:
             raise RuntimeError(f"kuma_unreachable_http_{r.status_code}")
+    except requests.exceptions.SSLError as e:
+        raise RuntimeError(
+            "kuma_ssl_verify_failed:"
+            + str(e)
+            + ";hint=Set WPCHECK_KUMA_URL to a hostname that matches the certificate, or set WPCHECK_KUMA_VERIFY_SSL=false (insecure)"
+        )
     except requests.RequestException as e:
         raise RuntimeError(f"kuma_unreachable:{e}")
 
@@ -1347,6 +1363,17 @@ args = parser.parse_args()
 
 def main() -> int:
     cfg = load_config(args)
+
+    if not cfg.kuma_verify_ssl:
+        try:
+            import urllib3  # type: ignore
+            from urllib3.exceptions import InsecureRequestWarning  # type: ignore
+
+            urllib3.disable_warnings(InsecureRequestWarning)
+        except Exception:
+            pass
+
+    log_event("config_kuma", kuma_url=cfg.kuma_url, kuma_verify_ssl=bool(cfg.kuma_verify_ssl))
     preflight(cfg)
 
     cache = read_cache(cfg.cache_file)
