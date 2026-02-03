@@ -212,7 +212,15 @@ def retry(
             return func()
         except Exception as e:
             last_exc = e
-            log_event(action, result="error", domain=domain, attempt=attempt, error=str(e))
+            log_event(
+                action,
+                result="error",
+                domain=domain,
+                attempt=attempt,
+                error=str(e),
+                error_type=type(e).__name__,
+                error_repr=repr(e),
+            )
             if attempt >= retries:
                 break
             time.sleep(delay)
@@ -231,10 +239,45 @@ def read_ignore_list(path: str) -> List[str]:
     entries: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            v = line.strip().lower()
-            if v:
-                entries.append(v)
+            v = line.strip()
+            if not v or v.startswith("#"):
+                continue
+            norm = normalize_domain_value(v)
+            if norm:
+                entries.append(norm)
     return entries
+
+
+def normalize_domain_value(raw: str) -> Optional[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("#"):
+        return None
+
+    candidate = raw
+    if "://" not in candidate and "/" in candidate:
+        candidate = "https://" + candidate
+
+    if "://" in candidate:
+        host = (urlparse(candidate).hostname or "").strip().lower()
+        return host or None
+
+    return raw.strip().lower()
+
+
+def build_ignored_set(ignored_list: List[str]) -> set:
+    out: set = set()
+    for d in ignored_list:
+        d = (d or "").strip().lower()
+        if not d:
+            continue
+        out.add(d)
+        if d.startswith("www."):
+            out.add(d[4:])
+        else:
+            out.add("www." + d)
+    return out
 
 
 def read_cache(path: str) -> Dict[str, Any]:
@@ -393,40 +436,62 @@ class KumaClient:
     def connect_and_login(self) -> None:
         if not self._cfg.kuma_url:
             raise ValueError("missing_kuma_url")
-        if self._connected:
-            self.disconnect()
-        self._monitor_list = {}
-        self._monitor_list_received = False
 
-        transports = ["websocket", "polling"] if websocket_client_available() else ["polling"]
-        try:
-            log_event("kuma_socket_connect", url=self._cfg.kuma_url, transports=transports)
-            self._sio.connect(self._cfg.kuma_url, transports=transports, wait_timeout=self._cfg.request_timeout)
-            self._connected = True
+        attempts: List[List[str]]
+        if websocket_client_available():
+            attempts = [["websocket"], ["polling"]]
+        else:
+            attempts = [["polling"]]
 
-            login_data: Dict[str, Any] = {
-                "username": self._cfg.kuma_user,
-                "password": self._cfg.kuma_pass,
-            }
-            if self._cfg.kuma_2fa_token:
-                login_data["token"] = self._cfg.kuma_2fa_token
+        last_exc: Optional[BaseException] = None
+        for transports in attempts:
+            if self._connected:
+                self.disconnect()
+            self._monitor_list = {}
+            self._monitor_list_received = False
 
-            res = self._sio.call("login", login_data, timeout=self._cfg.request_timeout)
-            if not isinstance(res, dict) or not res.get("ok"):
-                raise RuntimeError(f"kuma_login_failed:{res}")
-            log_event("kuma_socket_login_ok", url=self._cfg.kuma_url)
+            try:
+                log_event("kuma_socket_connect", url=self._cfg.kuma_url, transports=transports)
+                self._sio.connect(self._cfg.kuma_url, transports=transports, wait_timeout=self._cfg.request_timeout)
+                self._connected = True
 
-            end = time.time() + float(self._cfg.monitor_list_timeout)
-            while time.time() < end:
-                if self._monitor_list_received:
-                    break
-                time.sleep(0.25)
-            if not self._monitor_list_received:
-                raise RuntimeError("kuma_monitor_list_not_received")
-            log_event("kuma_monitor_list_received", count=len(self._monitor_list))
-        except Exception:
-            self.disconnect()
-            raise
+                login_data: Dict[str, Any] = {
+                    "username": self._cfg.kuma_user,
+                    "password": self._cfg.kuma_pass,
+                }
+                if self._cfg.kuma_2fa_token:
+                    login_data["token"] = self._cfg.kuma_2fa_token
+
+                res = self._sio.call("login", login_data, timeout=self._cfg.request_timeout)
+                if not isinstance(res, dict) or not res.get("ok"):
+                    raise RuntimeError(f"kuma_login_failed:{res}")
+                log_event("kuma_socket_login_ok", url=self._cfg.kuma_url, transports=transports)
+
+                end = time.time() + float(self._cfg.monitor_list_timeout)
+                while time.time() < end:
+                    if self._monitor_list_received:
+                        break
+                    time.sleep(0.25)
+                if not self._monitor_list_received:
+                    raise RuntimeError("kuma_monitor_list_not_received")
+                log_event("kuma_monitor_list_received", count=len(self._monitor_list), transports=transports)
+                return
+            except Exception as e:
+                last_exc = e
+                log_event(
+                    "kuma_socket_connect_failed",
+                    result="error",
+                    url=self._cfg.kuma_url,
+                    transports=transports,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    error_repr=repr(e),
+                )
+                self.disconnect()
+                continue
+
+        assert last_exc is not None
+        raise last_exc
 
     def disconnect(self) -> None:
         try:
@@ -523,27 +588,51 @@ def monitor_managed_by_wpcheck(monitor: Dict[str, Any]) -> bool:
     return "managed_by=wpcheck" in desc
 
 
-def build_description(site_path: str, domain: str, kind: str) -> str:
-    return f"managed_by=wpcheck;domain={domain};kind={kind};wp_path={site_path}"
+def parse_description_kv(desc: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for part in (desc or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k:
+            out[k] = v
+    return out
 
 
-def cleanup_ignored_domain(kuma: "KumaClient", cfg: Config, cache: Dict[str, Any], domain: str) -> None:
+def delete_wpcheck_monitors_for_domain(kuma: "KumaClient", cfg: Config, domain: str) -> bool:
     domain_l = (domain or "").strip().lower()
     if not domain_l:
-        return
+        return False
 
     monitors = kuma.list_monitors()
+    domain_aliases = {domain_l}
+    if domain_l.startswith("www."):
+        domain_aliases.add(domain_l[4:])
+    else:
+        domain_aliases.add("www." + domain_l)
+
+    expected_names = set()
+    for d in domain_aliases:
+        expected_names.add(f"WP | {d} | HTTP".lower())
+        expected_names.add(f"WP | {d} | CHECKSUM".lower())
+
     deleted_any = False
     for mon in monitors:
         if not isinstance(mon, dict):
             continue
-        if not monitor_managed_by_wpcheck(mon):
-            continue
-        desc_l = str(mon.get("description") or "").lower()
-        if f"domain={domain_l};" not in desc_l:
-            continue
-        mid = mon.get("id")
         name = str(mon.get("name") or "")
+        name_l = name.strip().lower()
+        desc_l = str(mon.get("description") or "").lower()
+
+        managed_match = monitor_managed_by_wpcheck(mon) and any(f"domain={d};" in desc_l for d in domain_aliases)
+        name_match = name_l in expected_names
+        if not (managed_match or name_match):
+            continue
+
+        mid = mon.get("id")
         if cfg.dry_run:
             log_event("cleanup_delete", domain=domain_l, monitor_id=mid, name=name, dry_run=True)
             deleted_any = True
@@ -553,7 +642,94 @@ def cleanup_ignored_domain(kuma: "KumaClient", cfg: Config, cache: Dict[str, Any
             log_event("cleanup_delete", domain=domain_l, monitor_id=int(mid), name=name)
             deleted_any = True
         except Exception as e:
-            log_event("cleanup_delete", result="error", domain=domain_l, monitor_id=mid, name=name, error=str(e))
+            log_event("cleanup_delete", result="error", domain=domain_l, monitor_id=mid, name=name, error=str(e), error_type=type(e).__name__, error_repr=repr(e))
+
+    return deleted_any
+
+
+def prune_orphan_monitoring_data(kuma: "KumaClient", cfg: Config, cache: Dict[str, Any]) -> None:
+    monitors = kuma.list_monitors()
+    deleted_any = False
+
+    for mon in monitors:
+        if not isinstance(mon, dict):
+            continue
+        if not monitor_managed_by_wpcheck(mon):
+            continue
+        desc = str(mon.get("description") or "")
+        kv = parse_description_kv(desc)
+        wp_path = str(kv.get("wp_path") or "").strip()
+        domain = str(kv.get("domain") or "").strip().lower()
+        if not wp_path:
+            continue
+        if os.path.isdir(wp_path):
+            continue
+
+        mid = mon.get("id")
+        name = str(mon.get("name") or "")
+        if cfg.dry_run:
+            log_event("prune_orphan_monitor", domain=domain or None, monitor_id=mid, name=name, wp_path=wp_path, dry_run=True)
+            deleted_any = True
+            continue
+        try:
+            kuma.delete_monitor(int(mid))
+            log_event("prune_orphan_monitor", domain=domain or None, monitor_id=int(mid), name=name, wp_path=wp_path)
+            deleted_any = True
+        except Exception as e:
+            log_event(
+                "prune_orphan_monitor",
+                result="error",
+                domain=domain or None,
+                monitor_id=mid,
+                name=name,
+                wp_path=wp_path,
+                error=str(e),
+                error_type=type(e).__name__,
+                error_repr=repr(e),
+            )
+
+    stale_domains: List[str] = []
+    for d, entry in list(cache.items()):
+        if not isinstance(entry, dict):
+            continue
+        site_path = str(entry.get("site_path") or "").strip()
+        if not site_path:
+            continue
+        if os.path.isdir(site_path):
+            continue
+        stale_domains.append(str(d).strip().lower())
+        log_event("prune_orphan_cache_entry", domain=str(d).strip().lower(), site_path=site_path, dry_run=cfg.dry_run)
+
+    for d in stale_domains:
+        deleted_any = delete_wpcheck_monitors_for_domain(kuma, cfg, d) or deleted_any
+        if cfg.dry_run:
+            continue
+        if d in cache:
+            del cache[d]
+
+    if stale_domains and not cfg.dry_run:
+        try:
+            write_cache_atomic(cfg.cache_file, cache)
+        except Exception as e:
+            log_event("cache_write", result="error", error=str(e), error_type=type(e).__name__, error_repr=repr(e), path=cfg.cache_file)
+
+    if deleted_any:
+        try:
+            kuma.refresh_monitor_list()
+        except Exception:
+            pass
+
+
+def build_description(site_path: str, domain: str, kind: str) -> str:
+    return f"managed_by=wpcheck;domain={domain};kind={kind};wp_path={site_path}"
+
+
+def cleanup_ignored_domain(kuma: "KumaClient", cfg: Config, cache: Dict[str, Any], domain: str) -> None:
+    domain_l = (domain or "").strip().lower()
+    if not domain_l:
+        return
+
+    deleted_any = delete_wpcheck_monitors_for_domain(kuma, cfg, domain_l)
 
     if domain_l in cache:
         if cfg.dry_run:
@@ -564,7 +740,7 @@ def cleanup_ignored_domain(kuma: "KumaClient", cfg: Config, cache: Dict[str, Any
             try:
                 write_cache_atomic(cfg.cache_file, cache)
             except Exception as e:
-                log_event("cache_write", result="error", domain=domain_l, error=str(e), path=cfg.cache_file)
+                log_event("cache_write", result="error", domain=domain_l, error=str(e), error_type=type(e).__name__, error_repr=repr(e), path=cfg.cache_file)
     elif deleted_any:
         log_event("cleanup_cache_missing", domain=domain_l)
 
@@ -899,6 +1075,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--limit", type=int, default=0, help="Limit number of sites to scan (0 = all)")
 parser.add_argument("--cleanup-only", action="store_true", help="Only cleanup ignored sites (managed monitors only)")
 parser.add_argument("--cleanup-ignored", action="store_true", help="Delete managed monitors for ignored domains")
+parser.add_argument("--prune-orphans", action="store_true", help="Delete wpcheck monitoring data for orphaned sites (missing wp_path/site_path)")
 parser.add_argument("--workers", type=int, default=None, help="Number of concurrent WP workers")
 parser.add_argument("--dry-run", action="store_true", help="Do not modify Kuma or filesystem")
 args = parser.parse_args()
@@ -910,7 +1087,7 @@ def main() -> int:
 
     cache = read_cache(cfg.cache_file)
     ignored_list = read_ignore_list(cfg.ignore_file)
-    ignored_set = set(ignored_list)
+    ignored_set = build_ignored_set(ignored_list)
 
     kuma = KumaClient(cfg)
     try:
@@ -923,12 +1100,16 @@ def main() -> int:
         )
         log_event("kuma_login", version=kuma._info.get("version"))
 
+        if args.prune_orphans:
+            prune_orphan_monitoring_data(kuma, cfg, cache)
+            return 0
+
         if args.cleanup_only:
             if not cfg.allow_delete_ignored_managed:
                 log_event("cleanup_skipped", result="error", error="cleanup_requires_flag", hint="use --cleanup-ignored")
                 return 2
 
-            for domain in sorted(ignored_set):
+            for domain in sorted(set(ignored_list)):
                 cleanup_ignored_domain(kuma, cfg, cache, domain)
             return 0
 
@@ -1064,5 +1245,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        log_event("fatal", result="error", error=str(e))
+        log_event("fatal", result="error", error=str(e), error_type=type(e).__name__, error_repr=repr(e))
         sys.exit(2)
