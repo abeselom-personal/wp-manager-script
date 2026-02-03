@@ -10,6 +10,8 @@ import shutil
 import socket
 import secrets
 import hashlib
+import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -194,6 +196,181 @@ def log_event(action: str, result: str = "ok", domain: Optional[str] = None, **f
         payload["domain"] = domain
     payload.update(fields)
     print(json.dumps(payload, separators=(",", ":"), sort_keys=True), flush=True)
+
+
+@dataclass
+class RunSummary:
+    mode: str
+    dry_run: bool
+    removed_monitors: List[Dict[str, Any]]
+    created_monitors: List[Dict[str, Any]]
+    cache_purges: List[Dict[str, Any]]
+    quarantined_files: List[Dict[str, Any]]
+    counts: Dict[str, int]
+    errors: Counter
+    _lock: threading.Lock
+
+    @staticmethod
+    def new(*, mode: str, dry_run: bool) -> "RunSummary":
+        return RunSummary(
+            mode=mode,
+            dry_run=dry_run,
+            removed_monitors=[],
+            created_monitors=[],
+            cache_purges=[],
+            quarantined_files=[],
+            counts={},
+            errors=Counter(),
+            _lock=threading.Lock(),
+        )
+
+    def inc(self, key: str, by: int = 1) -> None:
+        with self._lock:
+            self.counts[key] = int(self.counts.get(key, 0)) + int(by)
+
+    def add_removed_monitor(self, **row: Any) -> None:
+        with self._lock:
+            self.removed_monitors.append(dict(row))
+            self.counts["removed_monitors"] = int(self.counts.get("removed_monitors", 0)) + 1
+
+    def add_created_monitor(self, **row: Any) -> None:
+        with self._lock:
+            self.created_monitors.append(dict(row))
+            self.counts["created_monitors"] = int(self.counts.get("created_monitors", 0)) + 1
+
+    def add_cache_purge(self, **row: Any) -> None:
+        with self._lock:
+            self.cache_purges.append(dict(row))
+            self.counts["cache_purges"] = int(self.counts.get("cache_purges", 0)) + 1
+
+    def add_quarantine(self, **row: Any) -> None:
+        with self._lock:
+            self.quarantined_files.append(dict(row))
+            self.counts["quarantined_files"] = int(self.counts.get("quarantined_files", 0)) + 1
+
+    def add_error(self, err: str) -> None:
+        with self._lock:
+            self.errors[str(err or "unknown")] += 1
+
+
+RUN_SUMMARY: Optional[RunSummary] = None
+
+
+def _summary() -> Optional[RunSummary]:
+    return RUN_SUMMARY
+
+
+def _fmt_table(headers: List[str], rows: List[List[str]]) -> str:
+    cols = len(headers)
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i in range(cols):
+            widths[i] = max(widths[i], len(r[i]))
+
+    def _row(items: List[str]) -> str:
+        return " | ".join(items[i].ljust(widths[i]) for i in range(cols))
+
+    sep = "-+-".join("-" * w for w in widths)
+    out = [_row(headers), sep]
+    out.extend(_row(r) for r in rows)
+    return "\n".join(out)
+
+
+def print_run_summary(cfg: Config, summary: RunSummary) -> None:
+    max_items = 250
+
+    def _clip(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        if len(items) <= max_items:
+            return items, 0
+        return items[:max_items], len(items) - max_items
+
+    removed, removed_more = _clip(summary.removed_monitors)
+    created, created_more = _clip(summary.created_monitors)
+    purges, purges_more = _clip(summary.cache_purges)
+    quarantined, quarantined_more = _clip(summary.quarantined_files)
+
+    print("\n" + "=" * 72)
+    print("WPCHECK SUMMARY")
+    print("=" * 72)
+    print(f"Mode      : {summary.mode}")
+    print(f"Dry run   : {summary.dry_run}")
+    print(f"Kuma URL  : {cfg.kuma_url}")
+
+    if summary.counts:
+        count_rows = [[k, str(v)] for k, v in sorted(summary.counts.items(), key=lambda kv: kv[0])]
+        print("\nCOUNTS")
+        print(_fmt_table(["key", "value"], count_rows))
+
+    if summary.errors:
+        err_rows = [[k, str(v)] for k, v in sorted(summary.errors.items(), key=lambda kv: (-kv[1], kv[0]))]
+        print("\nERRORS")
+        print(_fmt_table(["error", "count"], err_rows))
+
+    if removed:
+        rows: List[List[str]] = []
+        for r in removed:
+            rows.append(
+                [
+                    str(r.get("source") or ""),
+                    str(r.get("domain") or ""),
+                    str(r.get("monitor_id") or ""),
+                    str(r.get("name") or ""),
+                    "DRY" if r.get("dry_run") else "",
+                ]
+            )
+        print("\nREMOVED MONITORS")
+        print(_fmt_table(["source", "domain", "id", "name", ""], rows))
+        if removed_more:
+            print(f"... and {removed_more} more removed monitor records")
+    else:
+        print("\nREMOVED MONITORS")
+        print("(none)")
+
+    if purges:
+        rows = []
+        for p in purges:
+            rows.append([str(p.get("source") or ""), str(p.get("domain") or ""), str(p.get("site_path") or ""), "DRY" if p.get("dry_run") else ""])
+        print("\nCACHE PURGES")
+        print(_fmt_table(["source", "domain", "site_path", ""], rows))
+        if purges_more:
+            print(f"... and {purges_more} more cache purge records")
+    else:
+        print("\nCACHE PURGES")
+        print("(none)")
+
+    if quarantined:
+        rows = []
+        for q in quarantined:
+            rows.append(
+                [
+                    str(q.get("domain") or ""),
+                    str(q.get("site_path") or ""),
+                    str(q.get("rel_path") or ""),
+                    str(q.get("dst") or ""),
+                    "DRY" if q.get("dry_run") else "",
+                ]
+            )
+        print("\nQUARANTINED FILES")
+        print(_fmt_table(["domain", "site_path", "rel_path", "dst", ""], rows))
+        if quarantined_more:
+            print(f"... and {quarantined_more} more quarantined file records")
+    else:
+        print("\nQUARANTINED FILES")
+        print("(none)")
+
+    if created:
+        rows = []
+        for c in created:
+            rows.append([str(c.get("kind") or ""), str(c.get("domain") or ""), str(c.get("monitor_id") or ""), str(c.get("name") or ""), "DRY" if c.get("dry_run") else ""])
+        print("\nCREATED MONITORS")
+        print(_fmt_table(["kind", "domain", "id", "name", ""], rows))
+        if created_more:
+            print(f"... and {created_more} more created monitor records")
+    else:
+        print("\nCREATED MONITORS")
+        print("(none)")
+
+    print("=" * 72 + "\n")
 
 
 def retry(
@@ -619,6 +796,14 @@ def delete_wpcheck_monitors_for_domain(kuma: "KumaClient", cfg: Config, domain: 
         expected_names.add(f"WP | {d} | HTTP".lower())
         expected_names.add(f"WP | {d} | CHECKSUM".lower())
 
+    log_event(
+        "cleanup_match_plan",
+        domain=domain_l,
+        domain_aliases=sorted(domain_aliases),
+        expected_names=sorted(expected_names),
+        monitors_total=len(monitors),
+    )
+
     deleted_any = False
     for mon in monitors:
         if not isinstance(mon, dict):
@@ -635,11 +820,17 @@ def delete_wpcheck_monitors_for_domain(kuma: "KumaClient", cfg: Config, domain: 
         mid = mon.get("id")
         if cfg.dry_run:
             log_event("cleanup_delete", domain=domain_l, monitor_id=mid, name=name, dry_run=True)
+            s = _summary()
+            if s is not None:
+                s.add_removed_monitor(source="cleanup_ignored", domain=domain_l, monitor_id=mid, name=name, dry_run=True)
             deleted_any = True
             continue
         try:
             kuma.delete_monitor(int(mid))
             log_event("cleanup_delete", domain=domain_l, monitor_id=int(mid), name=name)
+            s = _summary()
+            if s is not None:
+                s.add_removed_monitor(source="cleanup_ignored", domain=domain_l, monitor_id=int(mid), name=name, dry_run=False)
             deleted_any = True
         except Exception as e:
             log_event("cleanup_delete", result="error", domain=domain_l, monitor_id=mid, name=name, error=str(e), error_type=type(e).__name__, error_repr=repr(e))
@@ -669,11 +860,17 @@ def prune_orphan_monitoring_data(kuma: "KumaClient", cfg: Config, cache: Dict[st
         name = str(mon.get("name") or "")
         if cfg.dry_run:
             log_event("prune_orphan_monitor", domain=domain or None, monitor_id=mid, name=name, wp_path=wp_path, dry_run=True)
+            s = _summary()
+            if s is not None:
+                s.add_removed_monitor(source="prune_orphan", domain=domain or None, monitor_id=mid, name=name, dry_run=True, wp_path=wp_path)
             deleted_any = True
             continue
         try:
             kuma.delete_monitor(int(mid))
             log_event("prune_orphan_monitor", domain=domain or None, monitor_id=int(mid), name=name, wp_path=wp_path)
+            s = _summary()
+            if s is not None:
+                s.add_removed_monitor(source="prune_orphan", domain=domain or None, monitor_id=int(mid), name=name, dry_run=False, wp_path=wp_path)
             deleted_any = True
         except Exception as e:
             log_event(
@@ -699,6 +896,9 @@ def prune_orphan_monitoring_data(kuma: "KumaClient", cfg: Config, cache: Dict[st
             continue
         stale_domains.append(str(d).strip().lower())
         log_event("prune_orphan_cache_entry", domain=str(d).strip().lower(), site_path=site_path, dry_run=cfg.dry_run)
+        s = _summary()
+        if s is not None:
+            s.add_cache_purge(source="prune_orphan", domain=str(d).strip().lower(), site_path=site_path, dry_run=cfg.dry_run)
 
     for d in stale_domains:
         deleted_any = delete_wpcheck_monitors_for_domain(kuma, cfg, d) or deleted_any
@@ -734,9 +934,15 @@ def cleanup_ignored_domain(kuma: "KumaClient", cfg: Config, cache: Dict[str, Any
     if domain_l in cache:
         if cfg.dry_run:
             log_event("cleanup_cache_purge", domain=domain_l, dry_run=True)
+            s = _summary()
+            if s is not None:
+                s.add_cache_purge(source="cleanup_ignored", domain=domain_l, site_path=str(cache.get(domain_l, {}).get("site_path") or ""), dry_run=True)
         else:
             del cache[domain_l]
             log_event("cleanup_cache_purge", domain=domain_l)
+            s = _summary()
+            if s is not None:
+                s.add_cache_purge(source="cleanup_ignored", domain=domain_l, site_path="", dry_run=False)
             try:
                 write_cache_atomic(cfg.cache_file, cache)
             except Exception as e:
@@ -788,21 +994,53 @@ def ensure_domain_monitors(
     managed_http = [m for m in http_candidates if monitor_managed_by_wpcheck(m)]
     managed_checksum = [m for m in checksum_candidates if monitor_managed_by_wpcheck(m)]
 
+    log_event(
+        "kuma_monitor_candidates",
+        domain=domain,
+        http_name=http_name,
+        checksum_name=checksum_name,
+        monitors_total=len(monitors),
+        http_candidates=len(http_candidates),
+        checksum_candidates=len(checksum_candidates),
+        managed_http=len(managed_http),
+        managed_checksum=len(managed_checksum),
+        http_candidate_ids=[m.get("id") for m in http_candidates if isinstance(m, dict)],
+        checksum_candidate_ids=[m.get("id") for m in checksum_candidates if isinstance(m, dict)],
+    )
+
     if managed_http:
         http_mon = managed_http[0]
-        if len(managed_http) > 1 and cfg.allow_delete_managed_duplicates and not cfg.dry_run:
+        if len(managed_http) > 1 and cfg.allow_delete_managed_duplicates:
             for dup in managed_http[1:]:
-                kuma.delete_monitor(int(dup["id"]))
-                log_event("kuma_delete_duplicate", domain=domain, monitor_id=int(dup["id"]), name=http_name)
+                if cfg.dry_run:
+                    log_event("kuma_delete_duplicate", domain=domain, monitor_id=dup.get("id"), name=http_name, dry_run=True)
+                    s = _summary()
+                    if s is not None:
+                        s.add_removed_monitor(source="managed_duplicate", domain=domain, monitor_id=dup.get("id"), name=http_name, dry_run=True)
+                else:
+                    kuma.delete_monitor(int(dup["id"]))
+                    log_event("kuma_delete_duplicate", domain=domain, monitor_id=int(dup["id"]), name=http_name)
+                    s = _summary()
+                    if s is not None:
+                        s.add_removed_monitor(source="managed_duplicate", domain=domain, monitor_id=int(dup["id"]), name=http_name, dry_run=False)
     elif http_candidates:
         http_mon = http_candidates[0]
 
     if managed_checksum:
         checksum_mon = managed_checksum[0]
-        if len(managed_checksum) > 1 and cfg.allow_delete_managed_duplicates and not cfg.dry_run:
+        if len(managed_checksum) > 1 and cfg.allow_delete_managed_duplicates:
             for dup in managed_checksum[1:]:
-                kuma.delete_monitor(int(dup["id"]))
-                log_event("kuma_delete_duplicate", domain=domain, monitor_id=int(dup["id"]), name=checksum_name)
+                if cfg.dry_run:
+                    log_event("kuma_delete_duplicate", domain=domain, monitor_id=dup.get("id"), name=checksum_name, dry_run=True)
+                    s = _summary()
+                    if s is not None:
+                        s.add_removed_monitor(source="managed_duplicate", domain=domain, monitor_id=dup.get("id"), name=checksum_name, dry_run=True)
+                else:
+                    kuma.delete_monitor(int(dup["id"]))
+                    log_event("kuma_delete_duplicate", domain=domain, monitor_id=int(dup["id"]), name=checksum_name)
+                    s = _summary()
+                    if s is not None:
+                        s.add_removed_monitor(source="managed_duplicate", domain=domain, monitor_id=int(dup["id"]), name=checksum_name, dry_run=False)
     elif checksum_candidates:
         checksum_mon = checksum_candidates[0]
 
@@ -833,6 +1071,9 @@ def ensure_domain_monitors(
             except Exception:
                 pass
         log_event("kuma_http_monitor_create", domain=domain, monitor_id=http_id, name=http_name, dry_run=cfg.dry_run)
+        s = _summary()
+        if s is not None:
+            s.add_created_monitor(kind="http", domain=domain, monitor_id=http_id, name=http_name, dry_run=cfg.dry_run)
     else:
         http_id = int(http_mon["id"])
         if cfg.allow_take_ownership and not monitor_managed_by_wpcheck(http_mon):
@@ -872,6 +1113,9 @@ def ensure_domain_monitors(
             except Exception:
                 pass
         log_event("kuma_checksum_monitor_create", domain=domain, monitor_id=checksum_id, name=checksum_name, dry_run=cfg.dry_run)
+        s = _summary()
+        if s is not None:
+            s.add_created_monitor(kind="push", domain=domain, monitor_id=checksum_id, name=checksum_name, dry_run=cfg.dry_run)
     else:
         checksum_id = int(checksum_mon["id"])
         if cfg.dry_run:
@@ -1089,6 +1333,14 @@ def main() -> int:
     ignored_list = read_ignore_list(cfg.ignore_file)
     ignored_set = build_ignored_set(ignored_list)
 
+    global RUN_SUMMARY
+    mode = "scan"
+    if args.cleanup_only:
+        mode = "cleanup_only"
+    if args.prune_orphans:
+        mode = "prune_orphans"
+    RUN_SUMMARY = RunSummary.new(mode=mode, dry_run=cfg.dry_run)
+
     kuma = KumaClient(cfg)
     try:
         retry(
@@ -1102,15 +1354,24 @@ def main() -> int:
 
         if args.prune_orphans:
             prune_orphan_monitoring_data(kuma, cfg, cache)
+            s = _summary()
+            if s is not None:
+                s.inc("ignored_entries", len(set(ignored_list)))
+            print_run_summary(cfg, RUN_SUMMARY)
             return 0
 
         if args.cleanup_only:
             if not cfg.allow_delete_ignored_managed:
                 log_event("cleanup_skipped", result="error", error="cleanup_requires_flag", hint="use --cleanup-ignored")
+                print_run_summary(cfg, RUN_SUMMARY)
                 return 2
 
             for domain in sorted(set(ignored_list)):
                 cleanup_ignored_domain(kuma, cfg, cache, domain)
+            s = _summary()
+            if s is not None:
+                s.inc("ignored_entries", len(set(ignored_list)))
+            print_run_summary(cfg, RUN_SUMMARY)
             return 0
 
         sites: List[str] = []
@@ -1125,11 +1386,17 @@ def main() -> int:
         log_event("scan_start", sites=len(sites), workers=cfg.workers)
         failed_sites: Dict[str, str] = {}
         missing_domain_count = 0
+        ignored_count = 0
+        processed_count = 0
 
         with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
             futures = {ex.submit(process_site, cfg, site, ignored_set): site for site in sites}
             for fut in as_completed(futures):
                 res = fut.result()
+                processed_count += 1
+                s = _summary()
+                if s is not None:
+                    s.inc("sites_processed", 1)
                 if res.domain:
                     log_event(
                         "site_processed",
@@ -1151,6 +1418,27 @@ def main() -> int:
                     )
                     if res.error == "missing_domain":
                         missing_domain_count += 1
+                        if s is not None:
+                            s.inc("missing_domain", 1)
+
+                if res.ignored:
+                    ignored_count += 1
+                    if s is not None:
+                        s.inc("sites_ignored", 1)
+
+                if res.quarantined:
+                    if s is not None:
+                        for rel_path, dst in res.quarantined:
+                            s.add_quarantine(
+                                domain=res.domain or "",
+                                site_path=res.site_path,
+                                rel_path=rel_path,
+                                dst=dst or "",
+                                dry_run=cfg.dry_run,
+                            )
+
+                if res.error and s is not None:
+                    s.add_error(res.error)
 
                 if res.ignored and res.domain and cfg.allow_delete_ignored_managed:
                     cleanup_ignored_domain(kuma, cfg, cache, res.domain)
@@ -1207,6 +1495,8 @@ def main() -> int:
                 )
                 if res.checksum_failed:
                     failed_sites[domain] = res.site_path
+                    if s is not None:
+                        s.inc("checksum_failed", 1)
 
         if cfg.missing_domain_push_token and not cfg.dry_run:
             status = "up"
@@ -1236,6 +1526,15 @@ def main() -> int:
         log_event("scan_complete", failed=len(failed_sites), missing_domain_count=missing_domain_count)
         for d, p in sorted(failed_sites.items()):
             log_event("checksum_failure", result="error", domain=d, site_path=p)
+
+        s = _summary()
+        if s is not None:
+            s.inc("sites_total", len(sites))
+            s.inc("sites_processed_final", processed_count)
+            s.inc("sites_ignored_final", ignored_count)
+            s.inc("checksum_failed_domains", len(failed_sites))
+            s.inc("missing_domain_final", missing_domain_count)
+        print_run_summary(cfg, RUN_SUMMARY)
         return 1 if failed_sites else 0
     finally:
         kuma.disconnect()
