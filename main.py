@@ -1158,6 +1158,18 @@ def ensure_domain_monitors(
     return http_id, checksum_id, push_token
 
 
+def rotate_checksum_push_token(kuma: KumaClient, cfg: Config, *, monitor_id: int, parent: Optional[int]) -> str:
+    new_token = secrets.token_hex(16)
+    if cfg.dry_run:
+        return new_token
+    full = kuma.get_monitor(int(monitor_id))
+    full["pushToken"] = new_token
+    if parent is not None:
+        full["parent"] = parent
+    kuma.edit_monitor(full)
+    return new_token
+
+
 def preflight(cfg: Config) -> None:
     if os.path.sep in cfg.wpcli:
         if not os.path.isfile(cfg.wpcli) or not os.access(cfg.wpcli, os.X_OK):
@@ -1532,21 +1544,80 @@ def main() -> int:
 
                 status = "down" if res.checksum_failed else "up"
                 msg = "checksum_failed" if res.checksum_failed else "ok"
-                retry(
-                    lambda: send_push(
-                        cfg.kuma_url,
-                        push_token,
-                        status=status,
-                        msg=msg,
-                        timeout_s=cfg.request_timeout,
-                        verify_ssl=cfg.kuma_verify_ssl,
-                    ),
-                    retries=3,
-                    base_delay=1,
-                    max_delay=10,
-                    action="kuma_push",
-                    domain=domain,
-                )
+                try:
+                    did_rotate = False
+                    current_token = push_token
+
+                    checksum_parent = ensure_group_exists(kuma, cfg.checksum_group_id)
+
+                    def _push_once() -> str:
+                        nonlocal did_rotate, current_token
+                        try:
+                            send_push(
+                                cfg.kuma_url,
+                                current_token,
+                                status=status,
+                                msg=msg,
+                                timeout_s=cfg.request_timeout,
+                                verify_ssl=cfg.kuma_verify_ssl,
+                            )
+                            return current_token
+                        except Exception as e:
+                            if str(e) != "push_http_404":
+                                raise
+                            if did_rotate:
+                                raise
+                            did_rotate = True
+
+                            new_token = rotate_checksum_push_token(
+                                kuma,
+                                cfg,
+                                monitor_id=int(checksum_id),
+                                parent=checksum_parent,
+                            )
+                            current_token = new_token
+                            cache.setdefault(domain, {})
+                            cache[domain]["checksum_token"] = new_token
+                            try:
+                                write_cache_atomic(cfg.cache_file, cache)
+                            except Exception as ee:
+                                log_event("cache_write", result="error", domain=domain, error=str(ee), error_type=type(ee).__name__, error_repr=repr(ee), path=cfg.cache_file)
+                            log_event("kuma_push_token_rotated", domain=domain, monitor_id=int(checksum_id))
+
+                            send_push(
+                                cfg.kuma_url,
+                                current_token,
+                                status=status,
+                                msg=msg,
+                                timeout_s=cfg.request_timeout,
+                                verify_ssl=cfg.kuma_verify_ssl,
+                            )
+                            return current_token
+
+                    push_token = retry(
+                        _push_once,
+                        retries=3,
+                        base_delay=1,
+                        max_delay=10,
+                        action="kuma_push",
+                        domain=domain,
+                    )
+                    cache.setdefault(domain, {})
+                    cache[domain]["checksum_token"] = push_token
+                except Exception as e:
+                    log_event(
+                        "kuma_push_nonfatal",
+                        result="error",
+                        domain=domain,
+                        monitor_id=int(checksum_id),
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        error_repr=repr(e),
+                    )
+                    s = _summary()
+                    if s is not None:
+                        s.add_error("kuma_push_nonfatal")
+
                 if res.checksum_failed:
                     failed_sites[domain] = res.site_path
                     if s is not None:
@@ -1556,21 +1627,34 @@ def main() -> int:
             status = "up"
             if cfg.missing_domain_alert_threshold > 0 and missing_domain_count > cfg.missing_domain_alert_threshold:
                 status = "down"
-            retry(
-                lambda: send_push(
-                    cfg.kuma_url,
-                    cfg.missing_domain_push_token,
-                    status=status,
-                    msg=f"missing_domain={missing_domain_count};sites={len(sites)}",
-                    timeout_s=cfg.request_timeout,
-                    verify_ssl=cfg.kuma_verify_ssl,
-                ),
-                retries=3,
-                base_delay=1,
-                max_delay=10,
-                action="kuma_missing_domain_metric",
-                missing_domain_count=missing_domain_count,
-            )
+            try:
+                retry(
+                    lambda: send_push(
+                        cfg.kuma_url,
+                        cfg.missing_domain_push_token,
+                        status=status,
+                        msg=f"missing_domain={missing_domain_count};sites={len(sites)}",
+                        timeout_s=cfg.request_timeout,
+                        verify_ssl=cfg.kuma_verify_ssl,
+                    ),
+                    retries=3,
+                    base_delay=1,
+                    max_delay=10,
+                    action="kuma_missing_domain_metric",
+                    missing_domain_count=missing_domain_count,
+                )
+            except Exception as e:
+                log_event(
+                    "kuma_missing_domain_metric_nonfatal",
+                    result="error",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    error_repr=repr(e),
+                    missing_domain_count=missing_domain_count,
+                )
+                s = _summary()
+                if s is not None:
+                    s.add_error("kuma_missing_domain_metric_nonfatal")
             log_event(
                 "missing_domain_metric",
                 missing_domain_count=missing_domain_count,
