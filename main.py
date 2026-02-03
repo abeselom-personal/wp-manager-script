@@ -77,6 +77,7 @@ class Config:
     kuma_user: str
     kuma_pass: str
     kuma_2fa_token: Optional[str]
+    kuma_verify_ssl: bool
     checksum_group_id: Optional[int]
     http_group_id: Optional[int]
     push_interval: int
@@ -128,6 +129,8 @@ def load_config(args: argparse.Namespace) -> Config:
     if kuma_2fa_token is not None:
         kuma_2fa_token = kuma_2fa_token.strip() or None
 
+    kuma_verify_ssl = _env_bool("WPCHECK_KUMA_VERIFY_SSL", True)
+
     checksum_group_id = _env_optional_int("WPCHECK_CHECKSUM_GROUP_ID")
     http_group_id = _env_optional_int("WPCHECK_HTTP_GROUP_ID")
 
@@ -162,6 +165,7 @@ def load_config(args: argparse.Namespace) -> Config:
         kuma_user=kuma_user,
         kuma_pass=kuma_pass,
         kuma_2fa_token=kuma_2fa_token,
+        kuma_verify_ssl=kuma_verify_ssl,
         checksum_group_id=checksum_group_id,
         http_group_id=http_group_id,
         push_interval=push_interval,
@@ -574,12 +578,14 @@ class KumaClient:
     def __init__(self, config: Config):
         self._cfg = config
         self._session = requests.Session()
+        self._session.verify = bool(config.kuma_verify_ssl)
         self._sio = socketio.Client(
             logger=False,
             engineio_logger=False,
             reconnection=True,
             request_timeout=float(config.request_timeout),
             http_session=self._session,
+            ssl_verify=bool(config.kuma_verify_ssl),
         )
         self._monitor_list: Dict[str, Any] = {}
         self._monitor_list_received = False
@@ -749,10 +755,10 @@ class KumaClient:
             raise RuntimeError(f"kuma_delete_monitor_failed:{res}")
 
 
-def send_push(kuma_url: str, token: str, *, status: str, msg: str, timeout_s: int) -> None:
+def send_push(kuma_url: str, token: str, *, status: str, msg: str, timeout_s: int, verify_ssl: bool) -> None:
     url = f"{kuma_url}/api/push/{token}"
     params = {"status": status, "msg": msg}
-    r = requests.get(url, params=params, timeout=timeout_s)
+    r = requests.get(url, params=params, timeout=timeout_s, verify=bool(verify_ssl))
     if r.status_code != 200:
         raise RuntimeError(f"push_http_{r.status_code}")
     data = r.json()
@@ -1170,8 +1176,22 @@ def preflight(cfg: Config) -> None:
     if cfg.kuma_pass == "":
         raise RuntimeError("missing_env:WPCHECK_KUMA_PASS")
 
+    if not cfg.kuma_verify_ssl:
+        log_event(
+            "kuma_ssl_verify_disabled",
+            result="error",
+            hint="SSL verification disabled; prefer using a hostname that matches the certificate",
+        )
+        s = _summary()
+        if s is not None:
+            s.inc("kuma_verify_ssl_disabled", 1)
+
     try:
-        r = requests.get(f"{cfg.kuma_url}/api/entry-page", timeout=cfg.request_timeout)
+        r = requests.get(
+            f"{cfg.kuma_url}/api/entry-page",
+            timeout=cfg.request_timeout,
+            verify=bool(cfg.kuma_verify_ssl),
+        )
         if r.status_code >= 400:
             raise RuntimeError(f"kuma_unreachable_http_{r.status_code}")
     except requests.RequestException as e:
@@ -1486,7 +1506,14 @@ def main() -> int:
                 status = "down" if res.checksum_failed else "up"
                 msg = "checksum_failed" if res.checksum_failed else "ok"
                 retry(
-                    lambda: send_push(cfg.kuma_url, push_token, status=status, msg=msg, timeout_s=cfg.request_timeout),
+                    lambda: send_push(
+                        cfg.kuma_url,
+                        push_token,
+                        status=status,
+                        msg=msg,
+                        timeout_s=cfg.request_timeout,
+                        verify_ssl=cfg.kuma_verify_ssl,
+                    ),
                     retries=3,
                     base_delay=1,
                     max_delay=10,
@@ -1509,6 +1536,7 @@ def main() -> int:
                     status=status,
                     msg=f"missing_domain={missing_domain_count};sites={len(sites)}",
                     timeout_s=cfg.request_timeout,
+                    verify_ssl=cfg.kuma_verify_ssl,
                 ),
                 retries=3,
                 base_delay=1,
